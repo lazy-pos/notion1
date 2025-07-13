@@ -1,0 +1,184 @@
+/*
+  DIY Gimbal - MPU6050 Arduino Tutorial
+  by Dejan, www.HowToMechatronics.com
+  Code based on the MPU6050_DMP6 example from the i2cdevlib library by Jeff Rowberg:
+  https://github.com/jrowberg/i2cdevlib
+*/
+
+// I2C 통신을 위한 I2Cdev 라이브러리 포함
+#include "I2Cdev.h"
+
+// MPU6050의 DMP(Digital Motion Processor)를 사용하기 위한 헤더 포함
+#include "MPU6050_6Axis_MotionApps20.h"
+
+// I2Cdev 라이브러리에서 Wire 구현을 사용할 경우 Wire 라이브러리 포함
+#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+#include "Wire.h"
+#endif
+
+// 서보 모터 제어를 위한 Servo 라이브러리 포함
+#include <Servo.h>
+
+// MPU6050 객체 생성 (기본 I2C 주소 0x68 사용)
+MPU6050 mpu;
+
+// 서보 모터 3개 제어용 객체 선언
+Servo servo0;
+Servo servo1;
+Servo servo2;
+
+// Yaw 보정값 저장용 변수 및 보정 루프 카운터
+float correct;
+int j = 0;
+
+#define OUTPUT_READABLE_YAWPITCHROLL  // Yaw, Pitch, Roll 데이터를 사용하기 위한 정의
+
+#define INTERRUPT_PIN 2  // MPU6050의 인터럽트 핀을 Arduino의 핀 2번에 연결
+
+bool blinkState = false;
+
+// MPU 제어/상태 변수
+bool dmpReady = false;      // DMP 초기화 성공 여부
+uint8_t mpuIntStatus;       // 인터럽트 상태 바이트
+uint8_t devStatus;          // 장치 초기화 결과 상태값 (0이면 성공)
+uint16_t packetSize;        // DMP 패킷 크기 (기본 42바이트)
+uint16_t fifoCount;         // FIFO 버퍼에 현재 저장된 바이트 수
+uint8_t fifoBuffer[64];     // FIFO 버퍼 저장 공간
+
+// 자세 및 가속도 측정용 변수
+Quaternion q;               // 쿼터니언 데이터 (회전 표현)
+VectorInt16 aa;             // 원시 가속도 데이터
+VectorInt16 aaReal;         // 중력 제거 후 가속도 데이터
+VectorInt16 aaWorld;        // 월드 프레임 기준 가속도 데이터
+VectorFloat gravity;        // 중력 벡터
+float euler[3];             // 오일러 각 데이터
+float ypr[3];               // Yaw, Pitch, Roll 데이터
+
+// Teapot Demo를 위한 패킷 구조 (여기선 사용되지 않음)
+uint8_t teapotPacket[14] = { '$', 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x00, '\r', '\n' };
+
+// ================================================================
+// ===               INTERRUPT DETECTION ROUTINE                ===
+// ================================================================
+
+// 인터럽트 발생 시 호출될 함수 (플래그만 true로 설정)
+volatile bool mpuInterrupt = false;
+void dmpDataReady() {
+  mpuInterrupt = true;
+}
+
+// ================================================================
+// ===                      INITIAL SETUP                       ===
+// ================================================================
+
+void setup() {
+  // I2C 통신 시작
+#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+  Wire.begin();
+  Wire.setClock(400000); // I2C 클럭을 400kHz로 설정 (고속 통신)
+#elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
+  Fastwire::setup(400, true);  // Fastwire 방식일 경우 설정
+#endif
+
+  // 시리얼 통신 시작 (Teapot 데모 기준 38400 bps)
+  Serial.begin(38400);
+  while (!Serial); // Leonardo 보드인 경우 시리얼 연결 대기
+
+  // MPU6050 초기화
+  mpu.initialize();
+  pinMode(INTERRUPT_PIN, INPUT);  // 인터럽트 핀 입력 설정
+  devStatus = mpu.dmpInitialize();  // DMP 초기화 수행
+
+  // 자이로 및 가속도 오프셋 수동 설정
+  mpu.setXGyroOffset(17);
+  mpu.setYGyroOffset(-69);
+  mpu.setZGyroOffset(27);
+  mpu.setZAccelOffset(1551); // 가속도 오프셋 설정 (테스트값 사용)
+
+  // DMP 초기화가 성공한 경우
+  if (devStatus == 0) {
+    mpu.setDMPEnabled(true);  // DMP 활성화
+
+    // 인터럽트 등록 (인터럽트 핀에서 상승 에지 발생 시 dmpDataReady 함수 호출)
+    attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
+    mpuIntStatus = mpu.getIntStatus();  // 현재 인터럽트 상태 읽기
+
+    dmpReady = true;  // DMP 사용 가능 상태로 설정
+    packetSize = mpu.dmpGetFIFOPacketSize();  // DMP 패킷 크기 읽기
+  }
+
+  // 서보 모터 핀 설정 (PWM 핀에 연결)
+  servo0.attach(10);
+  servo1.attach(9);
+  servo2.attach(8);
+}
+
+// ================================================================
+// ===                    MAIN PROGRAM LOOP                     ===
+// ================================================================
+
+void loop() {
+  // DMP가 준비되지 않았다면 루프 중단
+  if (!dmpReady) return;
+
+  // MPU6050에서 새 데이터가 도착할 때까지 대기
+  while (!mpuInterrupt && fifoCount < packetSize) {
+    if (mpuInterrupt && fifoCount < packetSize) {
+      // 무한 루프 방지를 위해 FIFO 상태 확인
+      fifoCount = mpu.getFIFOCount();
+    }
+  }
+
+  // 인터럽트 플래그 리셋 및 상태 바이트 읽기
+  mpuInterrupt = false;
+  mpuIntStatus = mpu.getIntStatus();
+
+  // FIFO 버퍼에 저장된 바이트 수 읽기
+  fifoCount = mpu.getFIFOCount();
+
+  // FIFO 오버플로우 검사 (데이터 처리 지연 시 발생)
+  if ((mpuIntStatus & _BV(MPU6050_INTERRUPT_FIFO_OFLOW_BIT)) || fifoCount >= 1024) {
+    mpu.resetFIFO();          // FIFO 리셋
+    fifoCount = mpu.getFIFOCount();
+    Serial.println(F("FIFO overflow!"));  // 오류 메시지 출력
+
+  // 정상적으로 DMP 데이터가 준비된 경우
+  } else if (mpuIntStatus & _BV(MPU6050_INTERRUPT_DMP_INT_BIT)) {
+    // 충분한 데이터가 준비될 때까지 대기
+    while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
+
+    // FIFO에서 데이터 패킷 읽기
+    mpu.getFIFOBytes(fifoBuffer, packetSize);
+    fifoCount -= packetSize;  // 읽은 데이터만큼 카운트 감소
+
+    // Yaw, Pitch, Roll 계산
+#ifdef OUTPUT_READABLE_YAWPITCHROLL
+    mpu.dmpGetQuaternion(&q, fifoBuffer);              // 쿼터니언 추출
+    mpu.dmpGetGravity(&gravity, &q);                   // 중력 벡터 계산
+    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);         // Yaw, Pitch, Roll 계산
+
+    // 라디안 단위를 각도로 변환
+    ypr[0] = ypr[0] * 180 / M_PI;
+    ypr[1] = ypr[1] * 180 / M_PI;
+    ypr[2] = ypr[2] * 180 / M_PI;
+
+    // 초기 300회 반복 동안 Yaw 보정값 설정 (자기 기준점 확보)
+    if (j <= 300) {
+      correct = ypr[0];  // 초기 임의 Yaw 값 저장
+      j++;
+    } else {
+      ypr[0] = ypr[0] - correct;  // 초기값을 기준으로 Yaw를 0으로 정렬
+
+      // 서보 모터 제어 범위로 매핑 (-90~90 → 0~180)
+      int servo0Value = map(ypr[0], -90, 90, 0, 180);     // Yaw
+      int servo1Value = map(ypr[1], -90, 90, 0, 180);     // Pitch
+      int servo2Value = map(ypr[2], -90, 90, 180, 0);     // Roll (역방향 제어)
+
+      // 서보 모터 위치 설정
+      servo0.write(servo0Value);
+      servo1.write(servo1Value);
+      servo2.write(servo2Value);
+    }
+#endif
+  }
+}
